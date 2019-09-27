@@ -225,6 +225,38 @@ class TonlibClientBase:
 
         r = self._t_local.tonlib.ton_async_execute(data)
         return r
+    
+    @parallelize
+    def testwallet_send_grams(self, dest_address, seq_no, amount, message=b"54455354"):
+        """
+        TL Spec:
+            testWallet.sendGrams private_key:inputKey destination:accountAddress seqno:int32 
+            amount:int64 message:bytes = Ok;
+        :param dest_address: str with raw or user friendly address
+        :param seq_no: sequence number to gain consistency and prevent double spend
+        :param amount: given simple fraction where 'amount' is numerator and 10e8 in denominator. E.g. amount = 6666000000 will be 6.66 Grams
+        :return:
+        """
+        if len(dest_address.split(':')) == 2:
+            dest_address = raw_to_userfriendly(dest_address)
+        data = {
+            '@type': 'testWallet.sendGrams',
+            'private_key': {
+                'key': {
+                    'public_key': public_key,
+                    'secret': secret
+                }
+            }
+            'seqno': seq_no,
+            'amount': amount,
+            'destination': {
+                'account_address': dest_address
+            },
+            'message': message
+        }
+
+        r = self._t_local.tonlib.ton_async_execute(data)
+        return r
 
 # TODO testGiver.sendGrams destination:accountAddress seqno:int32 amount:int64 = Ok;
 
