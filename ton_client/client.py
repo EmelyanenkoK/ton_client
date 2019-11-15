@@ -1,30 +1,18 @@
 # -*- coding: utf-8 -*-
 
+import codecs
 import struct
 import socket
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import asyncio
-import functools
+from datetime import datetime, timezone
 
 import ujson as json
 from .tonlib import Tonlib
-from .utils import str_b64encode, raw_to_userfriendly
+from .utils import str_b64encode, raw_to_userfriendly, parallelize
 
 logger = logging.getLogger(__name__)
-
-
-def parallelize(f):
-    @functools.wraps(f)
-    def wrapper(self, *args, **kwds):
-        if self._style == 'futures':
-            return self._executor.submit(f, self, *args, **kwds)
-        if self._style == 'asyncio':
-            loop = asyncio.get_event_loop()
-            return loop.run_in_executor(self._executor, functools.partial(f, self, *args, **kwds))
-        raise RuntimeError(self._style)
-    return wrapper
 
 
 class TonlibClientBase:
@@ -36,16 +24,16 @@ class TonlibClientBase:
             ip='67.207.74.182',
             port=4924,
             key='peJTw/arlRfssgTuf9BMypJzqOi7SXEqSPSWiEw2U1M=',
-            keystore='./',
+            keystore=None,
             threads=10
     ):
         self._executor = ThreadPoolExecutor(
-            max_workers=threads,
+            max_workers=threads if keystore is not None else 1,  # one thread in case of in-memory keystore
             initializer=self.init_tonlib_thread,
             initargs=(ip, port, key, keystore)
         )
 
-    def init_tonlib_thread(self, ip, port, key, keystore):
+    def init_tonlib_thread(self, ip, port, key, keystore=None):
         """
         TL Spec
             init options:options = Ok;
@@ -53,7 +41,9 @@ class TonlibClientBase:
         :param ip: IPv4 address in dotted notation
         :param port: IPv4 TCP port
         :param key: base64 pub key of liteserver node
-        :param keystore: path to keystore on local filesystem
+        :param keystore: path to keystore on local filesystem on None for in-memory keystore. At the moment, in-memory keystore is almost useless
+            because randomness nature of thread pool of tonlibjson executors. It need to be completely rewritten using e.g. pep-0567 to support
+            some kind of affinity/statefulness between execution flow and thread. Otherwise, it might be simulated using threads=1
         :return: None
         """
         self._t_local.tonlib = Tonlib()
@@ -83,17 +73,29 @@ class TonlibClientBase:
             'validator': config_vl_obj
         }
 
+        if keystore:
+            keystore_obj = {
+                '@type': 'keyStoreTypeDirectory',
+                'directory': keystore
+            }
+        else:
+            keystore_obj = {
+                '@type': 'keyStoreTypeInMemory'
+            }
+
         data = {
             '@type': 'init',
             'options': {
                 '@type': 'options',
-                'config': json.dumps(config_obj),
-                'keystore_directory': keystore
+                'config': {
+                    '@type': 'config',
+                    'config': json.dumps(config_obj)
+                },
+                'keystore_type': keystore_obj
             }
         }
 
-        r = self._t_local.tonlib.ton_async_execute(data)
-        logging.debug(f'_init_lib() with query \'{data}\' and result {r}')
+        self._t_local.tonlib.ton_async_execute(data)
 
     @parallelize
     def testgiver_getaccount_address(self):
@@ -130,6 +132,86 @@ class TonlibClientBase:
         return r
 
     @parallelize
+    def raw_get_transactions(self, account_address: str, from_transaction_lt: str, from_transaction_hash: str):
+        """
+        TL Spec:
+            raw.getTransactions account_address:accountAddress from_transaction_id:internal.transactionId = raw.Transactions;
+            accountAddress account_address:string = AccountAddress;
+            internal.transactionId lt:int64 hash:bytes = internal.TransactionId;
+        :param account_address: str with raw or user friendly address
+        :param from_transaction_lt: from transaction lt
+        :param from_transaction_hash: from transaction hash in HEX representation
+        :return: dict as
+            {
+                '@type': 'raw.transactions',
+                'transactions': list[dict as {
+                    '@type': 'raw.transaction',
+                    'utime': int,
+                    'data': str,
+                    'transaction_id': internal.transactionId,
+                    'fee': str,
+                    'in_msg': dict as {
+                        '@type': 'raw.message',
+                        'source': str,
+                        'destination': str,
+                        'value': str,
+                        'message': str
+                    },
+                    'out_msgs': list[dict as raw.message]
+                }],
+                'previous_transaction_id': internal.transactionId
+            }
+        """
+        if len(account_address.split(':')) == 2:
+            account_address = raw_to_userfriendly(account_address)
+
+        from_transaction_hash = codecs.encode(codecs.decode(from_transaction_hash, 'hex'), 'base64').decode().replace("\n", "")
+
+        data = {
+            '@type': 'raw.getTransactions',
+            'account_address': {
+              'account_address': account_address,
+            },
+            'from_transaction_id': {
+                '@type': 'internal.transactionId',
+                'lt': from_transaction_lt,
+                'hash': from_transaction_hash
+            }
+        }
+        r = self._t_local.tonlib.ton_async_execute(data)
+        return r
+
+    @parallelize
+    def raw_get_account_state(self, address: str):
+        """
+        TL Spec:
+            raw.getAccountState account_address:accountAddress = raw.AccountState;
+            accountAddress account_address:string = AccountAddress;
+        :param address: str with raw or user friendly address
+        :return: dict as
+            {
+                '@type': 'raw.accountState',
+                'balance': str,
+                'code': str,
+                'data': str,
+                'last_transaction_id': internal.transactionId,
+                'sync_utime': int
+            }
+        """
+        if len(address.split(':')) == 2:
+            address = raw_to_userfriendly(address)
+
+        data = {
+            '@type': 'raw.getAccountState',
+            'account_address': {
+                'account_address': address
+            }
+        }
+
+        r = self._t_local.tonlib.ton_async_execute(data)
+        return r
+
+    @parallelize
     def testgiver_send_grams(self, dest_address, seq_no, amount):
         """
         TL Spec:
@@ -156,10 +238,10 @@ class TonlibClientBase:
         return r
 
     @parallelize
-    def test_wallet_init(self, public_key, secret):
+    def wallet_init(self, public_key, secret):
         """
         TL Spec:
-            testWallet.init private_key:inputKey = Ok;
+            wallet.init private_key:inputKey = Ok;
             key public_key:string secret:secureBytes = Key;
             inputKey key:key local_password:secureBytes = InputKey;
         :param public_key: str of base64 encoded public key as packed by e.g. create_new_key() or decrypt_key()
@@ -167,7 +249,7 @@ class TonlibClientBase:
         :return:
         """
         data = {
-            '@type': 'testWallet.init',
+            '@type': 'wallet.init',
             'private_key': {
                 'key': {
                     'public_key': public_key,
@@ -180,20 +262,19 @@ class TonlibClientBase:
         return r
 
     @parallelize
-    def test_wallet_get_account_address(self, public_key):
+    def wallet_get_account_address(self, public_key):
         """
         Specific method for getting address from public key. In contrast to Ethereum and many other blockchains,
         there is no 1-to-1 match between address and public key except this tonlib's internally hardcoded algorithm
         TL Spec:
-            testWallet.getAccountState account_address:accountAddress = testWallet.AccountState;
-            testWallet.accountState balance:int64 seqno:int32 last_transaction_id:internal.transactionId = testWallet.AccountState;
-            internal.transactionId lt:int64 hash:bytes = internal.TransactionId;
+            wallet.getAccountAddress initital_account_state:wallet.initialAccountState = AccountAddress;
+            wallet.initialAccountState public_key:string = wallet.InitialAccountState;
             accountAddress account_address:string = AccountAddress;
         :param public_key: str of base64 encoded public key as packed by e.g. create_new_key() or decrypt_key()
         :return:
         """
         data = {
-            '@type': 'testWallet.getAccountAddress',
+            '@type': 'wallet.getAccountAddress',
             'initital_account_state': {
                 'public_key': public_key
             }
@@ -203,11 +284,11 @@ class TonlibClientBase:
         return r
 
     @parallelize
-    def test_wallet_get_account_state(self, address: str):
+    def wallet_get_account_state(self, address: str):
         """
         TL Spec:
-            testWallet.getAccountState account_address:accountAddress = testWallet.AccountState;
-            testWallet.accountState balance:int64 seqno:int32 last_transaction_id:internal.transactionId = testWallet.AccountState;
+            wallet.getAccountState account_address:accountAddress = wallet.AccountState;
+            wallet.accountState balance:int64 seqno:int32 last_transaction_id:internal.transactionId sync_utime:int53 = wallet.AccountState;
             internal.transactionId lt:int64 hash:bytes = internal.TransactionId;
             accountAddress account_address:string = AccountAddress;
         :param address: str with raw or user friendly address
@@ -217,7 +298,7 @@ class TonlibClientBase:
             address = raw_to_userfriendly(address)
 
         data = {
-            '@type': 'testWallet.getAccountState',
+            '@type': 'wallet.getAccountState',
             'account_address': {
                 'account_address': address
             }
@@ -258,10 +339,51 @@ class TonlibClientBase:
         r = self._t_local.tonlib.ton_async_execute(data)
         return r
 
-# TODO testGiver.sendGrams destination:accountAddress seqno:int32 amount:int64 = Ok;
+    @parallelize
+    def wallet_send_grams(self, public_key, secret, dest_address, seq_no: int, valid_until: datetime, amount, message=''):
+        """
+        TL Spec
+            wallet.sendGrams private_key:inputKey destination:accountAddress seqno:int32 valid_until:int53 amount:int64 message:bytes
+                = SendGramsResult;
+            inputKey key:key local_password:secureBytes = InputKey;
+            key public_key:string secret:secureBytes = Key;
+            accountAddress account_address:string = AccountAddress;
+            sendGramsResult sent_until:int53 = SendGramsResult;
+        :param public_key:
+        :param secret:
+        :param dest_address:
+        :param seq_no:
+        :param valid_until:
+        :param amount:
+        :param message:
+        :return:
+        """
+        if valid_until.tzname() is None:
+            valid_until = datetime.replace(tzinfo=timezone.utc)
+        valid_until_ts = valid_until.timestamp()
+
+        data = {
+            '@type': 'wallet.sendGrams',
+            'private_key': {
+                'key': {
+                    'public_key': public_key,
+                    'secret': secret
+                }
+            },
+            'destination': {
+                'account_address': dest_address
+            },
+            'seqno': seq_no,
+            'valid_until': valid_until_ts,
+            'amount': amount,
+            'message': message
+        }
+
+        r = self._t_local.tonlib.ton_async_execute(data)
+        return r
 
     @parallelize
-    def create_new_key(self, local_password, mnemonic, random_extra_seed=''):
+    def create_new_key(self, mnemonic, random_extra_seed=None, local_password=None):
         """
         TL Spec:
             createNewKey local_password:secureBytes mnemonic_password:secureBytes = Key;
@@ -289,12 +411,14 @@ class TonlibClientBase:
         return r
 
     @parallelize
-    def delete_key(self, public_key):
+    def delete_key(self, public_key, secret):
         """
         TL Spec:
-            deleteKey public_key:bytes = Ok;
+            deleteKey key:key = Ok;
+            key public_key:string secret:secureBytes = Key;
         Key will be deleted from local fs (not at the litenode's fs) in keystore specified during __init__()
         :param public_key: base64 string of byte[32] of a public key
+        :param secret: base64 string of byte[32] of a public key
         :return: dict as
             {
                 '@type': 'ok' | 'error',
@@ -302,14 +426,18 @@ class TonlibClientBase:
         """
         data = {
             '@type': 'deleteKey',
-            'public_key': public_key
+            'key': {
+                'public_key': public_key,
+                'secret': secret
+            }
+
         }
 
         r = self._t_local.tonlib.ton_async_execute(data)
         return r
 
     @parallelize
-    def export_key(self, public_key, secret, local_password):
+    def export_key(self, public_key, secret, local_password=None):
         """
         TL Spec:
             exportKey input_key:inputKey = ExportedKey;
@@ -341,7 +469,37 @@ class TonlibClientBase:
         return r
 
     @parallelize
-    def export_pem_key(self, public_key, secret, local_password, key_password):
+    def import_pem_key(self, pem, local_password=None, key_password=None):
+        """
+        !Not supported yet!
+         TL Spec:
+            importPemKey local_password:secureBytes key_password:secureBytes exported_key:exportedPemKey = Key;
+            key public_key:bytes secret:secureBytes = Key;
+            exportedPemKey pem:secureString = ExportedPemKey;
+        :param pem: str of PEM key (starting with -----BEGIN ENCRYPTED PRIVATE KEY-----)
+        :param local_password: str of key to encrypt on-disk key stored in keystore (even in-memory)
+        :param key_password: str of key to decrypt input PEM itself
+        :return: dict as
+            {
+                '@type': 'key',
+                'public_key': str of base64 encoded public key,
+                'secret': str of base64 encoded secret
+            }
+        """
+        data = {
+            '@type': 'importPemKey',
+            'key_password': str_b64encode(key_password),
+            'local_password': str_b64encode(local_password),
+            'exported_key': {
+                'pem': pem
+            }
+        }
+
+        r = self._t_local.tonlib.ton_async_execute(data)
+        return r
+
+    @parallelize
+    def export_pem_key(self, public_key, secret, local_password=None, key_password=None):
         """
         !Not supported yet!
          TL Spec:
@@ -351,9 +509,13 @@ class TonlibClientBase:
             exportedPemKey pem:secureString = ExportedPemKey;
         :param public_key: str of base64 encoded public key as packed by e.g. create_new_key() or decrypt_key()
         :param secret: str of base64 encoded secret as packed by e.g. create_new_key() or decrypt_key()
-        :param local_password: string
+        :param local_password: str of key to decrypt on-disk key stored in keystore (even in-memory)
         :param key_password: key to encrypt resulting PEM itself
-        :return:
+        :return: dict as
+            {
+                '@type': 'exportedPemKey',
+                'pem': str of PEM key (starting with -----BEGIN ENCRYPTED PRIVATE KEY-----) encrypted with key_password
+            }
         """
         data = {
             '@type': 'exportPemKey',
@@ -371,7 +533,7 @@ class TonlibClientBase:
         return r
 
     @parallelize
-    def export_encrypted_key(self, public_key, secret, local_password, key_password):
+    def export_encrypted_key(self, public_key, secret, local_password=None, key_password=None):
         """
          TL Spec:
             exportEncryptedKey input_key:inputKey key_password:secureBytes = ExportedEncryptedKey;
@@ -380,9 +542,13 @@ class TonlibClientBase:
             exportedEncryptedKey data:secureBytes = ExportedEncryptedKey;
         :param public_key: str of base64 encoded public key as packed by e.g. create_new_key() or decrypt_key()
         :param secret: str of base64 encoded secret as packed by e.g. create_new_key() or decrypt_key()
-        :param local_password: string
-        :param key_password: key to encrypt resulting PEM itself
-        :return:
+        :param local_password: str of key to decrypt on-disk key stored in keystore (even in-memory)
+        :param key_password: key to encrypt resulting key itself
+        :return: dict as
+            {
+                '@type': 'exportedEncryptedKey',
+                'data': str of base64 encoded key which is previously encrypted with key_password
+            }
         """
         data = {
             '@type': 'exportEncryptedKey',
@@ -400,7 +566,36 @@ class TonlibClientBase:
         return r
 
     @parallelize
-    def import_key(self, local_password, mnemonic_password, mnemonic):
+    def import_encrypted_key(self, encrypted_key, local_password=None, key_password=None):
+        """
+         TL Spec:
+            importEncryptedKey local_password:secureBytes key_password:secureBytes exported_encrypted_key:exportedEncryptedKey = Key;
+            key public_key:bytes secret:secureBytes = Key;
+            exportedEncryptedKey data:secureBytes = ExportedEncryptedKey;
+        :param encrypted_key: str of base64 encoded key which is also previously encrypted with key_password
+        :param local_password: str of key to encrypt on-disk key stored in keystore (even in-memory)
+        :param key_password: key to decrypt encrypted key itself
+        :return: dict as
+            {
+                '@type': 'key',
+                'public_key': str of base64 encoded public key,
+                'secret': str of base64 encoded secret
+            }
+        """
+        data = {
+            '@type': 'importEncryptedKey',
+            'key_password': str_b64encode(key_password),
+            'local_password': str_b64encode(local_password),
+            'exported_encrypted_key': {
+                'data': encrypted_key
+            }
+        }
+
+        r = self._t_local.tonlib.ton_async_execute(data)
+        return r
+
+    @parallelize
+    def import_key(self, mnemonic_password, local_password=None, mnemonic=None):
         """
         TL Spec:
             importKey local_password:secureBytes mnemonic_password:secureBytes exported_key:exportedKey = Key;
@@ -458,6 +653,18 @@ class TonlibClientBase:
                 }
             }
 
+        }
+
+        r = self._t_local.tonlib.ton_async_execute(data)
+        return r
+
+    @parallelize
+    def external_kdf(self, password, salt, iterations):
+        data = {
+            '@type': 'kdf',
+            'password': str_b64encode(password),
+            'salt': str_b64encode(salt),
+            'iterations': iterations
         }
 
         r = self._t_local.tonlib.ton_async_execute(data)

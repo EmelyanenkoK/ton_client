@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 
 from ctypes import CDLL, c_void_p, c_char_p, c_double
-import json
 import logging
 import platform
+import inspect
 
 import pkg_resources
+
+import ujson as json
+
+from ton_client.utils import TonLibWrongResult
 
 logger = logging.getLogger(__name__)
 
@@ -59,27 +63,69 @@ class Tonlib:
     def __del__(self):
         self._tonlib_json_client_destroy(self._client)
 
-    def ton_send(self, query):
-        query = json.dumps(query).encode('utf-8')
-        self._tonlib_json_client_send(self._client, query)
-        logging.debug(f'ton_send() with query \'{query}\'')
+    @staticmethod
+    def hide_dict(d):
+        return {k: '*' * len(str(v)) if k != '@type' else v for k, v in d.items()}
 
-    def ton_receive(self, timeout=10.0):
+    def ton_send(self, query):
+        if not isinstance(query, dict):
+            raise TonLibWrongResult(f'query must be a dictionary, got {type(query)}')
+
+        unhidden_query = json.dumps(query).encode('utf-8')
+        self._tonlib_json_client_send(self._client, unhidden_query)
+
+        fr = inspect.getouterframes(inspect.currentframe())[1]
+        logger.debug(f'{fr.filename}:{fr.lineno} at {fr.function}() called ton_send({self.hide_dict(query)})')
+
+    def ton_receive(self, timeout=30.0):
         result = self._tonlib_json_client_receive(self._client, timeout)
         if result:
             result = json.loads(result.decode('utf-8'))
-        logging.debug(f'ton_receive() with result \'{result}\'')
+
+        if not isinstance(result, dict):
+            raise TonLibWrongResult(f'result must be a dictionary, got {type(result)}')
+
+        fr = inspect.getouterframes(inspect.currentframe())[1]
+        hidden_result = self.hide_dict(result)
+        logger.debug(f'{fr.filename}:{fr.lineno} at {fr.function}() called ton_receive() -> {hidden_result}')
+
         return result
 
-    def ton_async_execute(self, query, timeout=10.0):
-        self.ton_send(query)
-        return self.ton_receive(timeout)
+    def ton_async_execute(self, query, timeout=30.0):
+        if not isinstance(query, dict):
+            raise TonLibWrongResult(f'query must be a dictionary, got {type(query)}')
 
-    def ton_sync_execute(self, query):
-        query = json.dumps(query).encode('utf-8')
-        result = self._tonlib_json_client_execute(None, query)
+        unhidden_query = json.dumps(query).encode('utf-8')
+        self._tonlib_json_client_send(self._client, unhidden_query)
+        result = self._tonlib_json_client_receive(self._client, timeout)
         if result:
             result = json.loads(result.decode('utf-8'))
-        logging.debug(f'ton_execute() with query \'{query}\' '
-                      f'and result \'{result}\'')
+
+        if not isinstance(result, dict):
+            raise TonLibWrongResult(f'result must be a dictionary, got {type(result)}')
+
+        fr = inspect.getouterframes(inspect.currentframe())[1]
+        hidden_query = self.hide_dict(query)
+        hidden_result = self.hide_dict(result)
+        logger.debug(f'{fr.filename}:{fr.lineno} at {fr.function}() called ton_async_execute({hidden_query}) -> {hidden_result}')
+
+        return result
+
+    def ton_sync_execute(self, query):
+        if not isinstance(query, dict):
+            raise TonLibWrongResult(f'query must be a dictionary, got {type(query)}')
+
+        unhidden_query = json.dumps(query).encode('utf-8')
+        result = self._tonlib_json_client_execute(None, unhidden_query)
+        if result:
+            result = json.loads(result.decode('utf-8'))
+
+        if not isinstance(result, dict):
+            raise TonLibWrongResult(f'result must be a dictionary, got {type(result)}')
+
+        fr = inspect.getouterframes(inspect.currentframe())[1]
+        hidden_query = self.hide_dict(query)
+        hidden_result = self.hide_dict(result)
+        logger.debug(f'{fr.filename}:{fr.lineno} at {fr.function}() called ton_sync_execute({hidden_query}) -> {hidden_result}')
+
         return result
